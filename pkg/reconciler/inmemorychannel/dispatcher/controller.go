@@ -49,6 +49,7 @@ import (
 	"knative.dev/eventing/pkg/apis/feature"
 	"knative.dev/eventing/pkg/channel"
 	eventingclient "knative.dev/eventing/pkg/client/injection/client"
+	eventtypeinformer "knative.dev/eventing/pkg/client/injection/informers/eventing/v1beta2/eventtype"
 	inmemorychannelinformer "knative.dev/eventing/pkg/client/injection/informers/messaging/v1/inmemorychannel"
 	inmemorychannelreconciler "knative.dev/eventing/pkg/client/injection/reconciler/messaging/v1/inmemorychannel"
 	"knative.dev/eventing/pkg/inmemorychannel"
@@ -62,7 +63,6 @@ const (
 	httpPort      = 8080
 	httpsPort     = 8443
 	finalizerName = "imc-dispatcher"
-	tlsSecretName = "imc-dispatcher-server-tls"
 )
 
 type envConfig struct {
@@ -109,7 +109,7 @@ func NewController(
 
 	reporter := channel.NewStatsReporter(env.ContainerName, kmeta.ChildName(env.PodName, uuid.New().String()))
 
-	sh := multichannelfanout.NewMessageHandler(ctx, logger.Desugar())
+	sh := multichannelfanout.NewEventHandler(ctx, logger.Desugar())
 
 	inmemorychannelInformer := inmemorychannelinformer.Get(ctx)
 
@@ -119,10 +119,13 @@ func NewController(
 	}
 
 	r := &Reconciler{
-		multiChannelMessageHandler: sh,
-		reporter:                   reporter,
-		messagingClientSet:         eventingclient.Get(ctx).MessagingV1(),
+		multiChannelEventHandler: sh,
+		reporter:                 reporter,
+		messagingClientSet:       eventingclient.Get(ctx).MessagingV1(),
+		eventingClient:           eventingclient.Get(ctx).EventingV1beta2(),
+		eventTypeLister:          eventtypeinformer.Get(ctx).Lister(),
 	}
+
 	impl := inmemorychannelreconciler.NewImpl(ctx, r, func(impl *controller.Impl) controller.Options {
 		return controller.Options{SkipStatusUpdates: true, FinalizerName: finalizerName}
 	})
@@ -142,23 +145,25 @@ func NewController(
 	})
 	featureStore.WatchConfigs(cmw)
 
-	httpArgs := &inmemorychannel.InMemoryMessageDispatcherArgs{
+	r.featureStore = featureStore
+
+	httpArgs := &inmemorychannel.InMemoryEventDispatcherArgs{
 		Port:         httpPort,
 		ReadTimeout:  readTimeout,
 		WriteTimeout: writeTimeout,
 		Handler:      sh,
 		Logger:       logger.Desugar(),
 
-		HTTPMessageReceiverOptions: []kncloudevents.HTTPMessageReceiverOption{
+		HTTPEventReceiverOptions: []kncloudevents.HTTPEventReceiverOption{
 			kncloudevents.WithChecker(readinessCheckerHTTPHandler(readinessChecker)),
 		},
 	}
-	httpDispatcher := inmemorychannel.NewMessageDispatcher(httpArgs)
+	httpDispatcher := inmemorychannel.NewEventDispatcher(httpArgs)
 	httpReceiver := httpDispatcher.GetReceiver()
 
 	secret := types.NamespacedName{
 		Namespace: system.Namespace(),
-		Name:      tlsSecretName,
+		Name:      eventingtls.IMCDispatcherServerTLSSecretName,
 	}
 	serverTLSConfig := eventingtls.NewDefaultServerConfig()
 	serverTLSConfig.GetCertificate = eventingtls.GetCertificateFromSecret(ctx, secretinformer.Get(ctx), kubeclient.Get(ctx), secret)
@@ -166,16 +171,16 @@ func NewController(
 	if err != nil {
 		logger.Panicf("unable to get tls config: %s", err)
 	}
-	httpsArgs := &inmemorychannel.InMemoryMessageDispatcherArgs{
+	httpsArgs := &inmemorychannel.InMemoryEventDispatcherArgs{
 		Port:         httpsPort,
 		ReadTimeout:  readTimeout,
 		WriteTimeout: writeTimeout,
 		Handler:      sh,
 		Logger:       logger.Desugar(),
 
-		HTTPMessageReceiverOptions: []kncloudevents.HTTPMessageReceiverOption{kncloudevents.WithTLSConfig(tlsConfig)},
+		HTTPEventReceiverOptions: []kncloudevents.HTTPEventReceiverOption{kncloudevents.WithTLSConfig(tlsConfig)},
 	}
-	httpsDispatcher := inmemorychannel.NewMessageDispatcher(httpsArgs)
+	httpsDispatcher := inmemorychannel.NewEventDispatcher(httpsArgs)
 	httpsReceiver := httpsDispatcher.GetReceiver()
 
 	s, err := eventingtls.NewServerManager(ctx, &httpReceiver, &httpsReceiver, httpDispatcher.GetHandler(ctx), cmw)

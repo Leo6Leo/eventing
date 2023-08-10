@@ -5,6 +5,7 @@ This doc explains how to setup a development environment so you can get started
 Also take a look at:
 
 - [The pull request workflow](https://www.knative.dev/contributing/contributing/#pull-requests)
+- [Quick full build and install](#quick-full-build-and-install)
 - [How to add and run tests](./test/README.md)
 - [Iterating](#iterating)
 
@@ -21,7 +22,7 @@ Also take a look at:
 > :information_source: If you intend to use event sinks based on Knative
 > Services as described in some of our examples, consider installing
 > [Knative Serving](http://github.com/knative/serving). A few
-> [Knative Sandbox](https://github.com/knative-sandbox/?q=eventing&type=&language=)
+> [Knative Extensions](https://github.com/knative-extensions/?q=eventing&type=&language=)
 > projects also have a dependency on Serving.
 
 Before submitting a PR, see also [contribution guidelines](./CONTRIBUTING.md).
@@ -109,6 +110,23 @@ _Adding the `upstream` remote sets you up nicely for regularly
 
 Once you reach this point you are ready to do a full build and deploy as
 follows.
+
+## Quick full build and install
+
+Eventing components are pluggable, and you can install specific components depending on your
+needs, however, for a full build and install, you can run:
+
+```shell
+./hack/install.sh
+```
+
+By default, it will build container images for the architecture of your local machine, if you need
+to build images for a different platform (OS and architecture), you can provide `KO_FLAGS` as
+follow:
+
+```shell
+KO_FLAGS=--platform="linux/amd64" ./hack/install.sh
+```
 
 ## Starting Eventing Controller
 

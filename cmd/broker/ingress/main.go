@@ -41,10 +41,13 @@ import (
 	tracingconfig "knative.dev/pkg/tracing/config"
 
 	cmdbroker "knative.dev/eventing/cmd/broker"
+	"knative.dev/eventing/pkg/apis/feature"
 	broker "knative.dev/eventing/pkg/broker"
 	"knative.dev/eventing/pkg/broker/ingress"
+	eventingclient "knative.dev/eventing/pkg/client/injection/client"
 	brokerinformer "knative.dev/eventing/pkg/client/injection/informers/eventing/v1/broker"
-	"knative.dev/eventing/pkg/kncloudevents"
+	eventtypeinformer "knative.dev/eventing/pkg/client/injection/informers/eventing/v1beta2/eventtype"
+	"knative.dev/eventing/pkg/eventtype"
 	"knative.dev/eventing/pkg/reconciler/names"
 )
 
@@ -68,6 +71,8 @@ type envConfig struct {
 	ContainerName string `envconfig:"CONTAINER_NAME" required:"true"`
 	Port          int    `envconfig:"INGRESS_PORT" default:"8080"`
 	MaxTTL        int    `envconfig:"MAX_TTL" default:"255"`
+	HTTPPort      int    `envconfig:"INGRESS_PORT" default:"8080"`
+	HTTPSPort     int    `envconfig:"INGRESS_PORT_HTTPS" default:"8443"`
 }
 
 func main() {
@@ -103,7 +108,7 @@ func main() {
 
 	logger.Info("Starting the Broker Ingress")
 
-	brokerLister := brokerinformer.Get(ctx).Lister()
+	brokerInformer := brokerinformer.Get(ctx)
 
 	// Watch the logging config map and dynamically update logging levels.
 	configMapWatcher := configmap.NewInformedWatcher(kubeclient.Get(ctx), system.Namespace())
@@ -126,30 +131,35 @@ func main() {
 		logger.Fatal("Error setting up trace publishing", zap.Error(err))
 	}
 
-	connectionArgs := kncloudevents.ConnectionArgs{
-		MaxIdleConns:        defaultMaxIdleConnections,
-		MaxIdleConnsPerHost: defaultMaxIdleConnectionsPerHost,
-	}
-	kncloudevents.ConfigureConnectionArgs(&connectionArgs)
-	sender, err := kncloudevents.NewHTTPMessageSenderWithTarget("")
-	if err != nil {
-		logger.Fatal("Unable to create message sender", zap.Error(err))
-	}
+	featureStore := feature.NewStore(logging.FromContext(ctx).Named("feature-config-store"))
+	featureStore.WatchConfigs(configMapWatcher)
 
 	reporter := ingress.NewStatsReporter(env.ContainerName, kmeta.ChildName(env.PodName, uuid.New().String()))
 
-	h := &ingress.Handler{
-		Receiver:     kncloudevents.NewHTTPMessageReceiver(env.Port),
-		Sender:       sender,
-		Defaulter:    broker.TTLDefaulter(logger, int32(env.MaxTTL)),
-		Reporter:     reporter,
-		Logger:       logger,
-		BrokerLister: brokerLister,
+	handler, err := ingress.NewHandler(logger, reporter, broker.TTLDefaulter(logger, int32(env.MaxTTL)), brokerInformer)
+	if err != nil {
+		logger.Fatal("Error creating Handler", zap.Error(err))
+	}
+
+	serverManager, err := ingress.NewServerManager(ctx, logger, configMapWatcher, env.HTTPPort, env.HTTPSPort, handler)
+	if err != nil {
+		logger.Fatal("Error creating server manager", zap.Error(err))
 	}
 
 	// configMapWatcher does not block, so start it first.
 	if err = configMapWatcher.Start(ctx.Done()); err != nil {
 		logger.Warn("Failed to start ConfigMap watcher", zap.Error(err))
+	}
+
+	// Init auto-create only if enabled, after ConfigMap watcher is started
+	if featureStore.IsEnabled(feature.EvenTypeAutoCreate) {
+		autoCreate := &eventtype.EventTypeAutoHandler{
+			EventTypeLister: eventtypeinformer.Get(ctx).Lister(),
+			EventingClient:  eventingclient.Get(ctx).EventingV1beta2(),
+			FeatureStore:    featureStore,
+			Logger:          logger,
+		}
+		handler.EvenTypeHandler = autoCreate
 	}
 
 	// Start all of the informers and wait for them to sync.
@@ -158,9 +168,11 @@ func main() {
 		logger.Fatal("Failed to start informers", zap.Error(err))
 	}
 
-	// Start blocks forever.
-	if err = h.Start(ctx); err != nil {
-		logger.Error("ingress.Start() returned an error", zap.Error(err))
+	// Start the servers
+	logger.Info("Ingress starting...")
+	err = serverManager.StartServers(ctx)
+	if err != nil {
+		logger.Fatal("serverManager.StartServers() returned an error", zap.Error(err))
 	}
 	tracer.Shutdown(context.Background())
 	logger.Info("Exiting...")

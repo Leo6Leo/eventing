@@ -30,7 +30,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"knative.dev/pkg/apis"
 	duckv1 "knative.dev/pkg/apis/duck/v1"
 	"knative.dev/pkg/injection/clients/dynamicclient"
 	"knative.dev/reconciler-test/pkg/environment"
@@ -145,7 +144,7 @@ func HasDeadLetterSinkURI(name string, gvr schema.GroupVersionResource) feature.
 }
 
 // Address returns a Channel's address.
-func Address(ctx context.Context, name string, timings ...time.Duration) (*apis.URL, error) {
+func Address(ctx context.Context, name string, timings ...time.Duration) (*duckv1.Addressable, error) {
 	return addressable.Address(ctx, GVR(), name, timings...)
 }
 
@@ -173,3 +172,18 @@ func AsDestinationRef(name string) *duckv1.Destination {
 
 // WithDeadLetterSink adds the dead letter sink related config to a Subscription spec.
 var WithDeadLetterSink = delivery.WithDeadLetterSink
+
+// ValidateAddress validates the address retured by Address
+func ValidateAddress(name string, validate addressable.ValidateAddress, timings ...time.Duration) feature.StepFn {
+	return func(ctx context.Context, t feature.T) {
+		addr, err := Address(ctx, name, timings...)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if err := validate(addr); err != nil {
+			t.Error(err)
+			return
+		}
+	}
+}

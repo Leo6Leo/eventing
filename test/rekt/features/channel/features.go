@@ -26,6 +26,8 @@ import (
 	"github.com/cloudevents/sdk-go/v2/test"
 	"github.com/google/uuid"
 	duckv1 "knative.dev/pkg/apis/duck/v1"
+	"knative.dev/pkg/network"
+	"knative.dev/reconciler-test/pkg/environment"
 	"knative.dev/reconciler-test/pkg/eventshub"
 	"knative.dev/reconciler-test/pkg/feature"
 	"knative.dev/reconciler-test/pkg/manifest"
@@ -35,6 +37,7 @@ import (
 
 	eventasssert "knative.dev/reconciler-test/pkg/eventshub/assert"
 
+	"knative.dev/eventing/test/rekt/features"
 	"knative.dev/eventing/test/rekt/resources/channel"
 	"knative.dev/eventing/test/rekt/resources/channel_impl"
 	"knative.dev/eventing/test/rekt/resources/containersource"
@@ -107,10 +110,12 @@ func DeadLetterSink(createSubscriberFn func(ref *duckv1.KReference, uri string) 
 	f.Requirement("containersource is ready", containersource.IsReady(cs))
 	f.Requirement("Channel has dead letter sink uri", channel_impl.HasDeadLetterSinkURI(name, channel_impl.GVR()))
 
-	f.Assert("dls receives events", assert.OnStore(sink).
-		MatchEvent(test.HasType("dev.knative.eventing.samples.heartbeat")).
-		AtLeast(1),
-	)
+	f.Assert("dls receives events", func(ctx context.Context, t feature.T) {
+		assert.OnStore(sink).
+			Match(features.HasKnNamespaceHeader(environment.FromContext(ctx).Namespace())).
+			MatchEvent(test.HasType("dev.knative.eventing.samples.heartbeat")).
+			AtLeast(1)(ctx, t)
+	})
 
 	return f
 }
@@ -140,10 +145,12 @@ func DeadLetterSinkGenericChannel(createSubscriberFn func(ref *duckv1.KReference
 	f.Requirement("containersource is ready", containersource.IsReady(cs))
 	f.Requirement("Channel has dead letter sink uri", channel_impl.HasDeadLetterSinkURI(name, channel.GVR()))
 
-	f.Assert("dls receives events", assert.OnStore(sink).
-		MatchEvent(test.HasType("dev.knative.eventing.samples.heartbeat")).
-		AtLeast(1),
-	)
+	f.Assert("dls receives events", func(ctx context.Context, t feature.T) {
+		assert.OnStore(sink).
+			Match(features.HasKnNamespaceHeader(environment.FromContext(ctx).Namespace())).
+			MatchEvent(test.HasType("dev.knative.eventing.samples.heartbeat")).
+			AtLeast(1)(ctx, t)
+	})
 
 	return f
 }
@@ -306,10 +313,12 @@ func ChannelPreferHeaderCheck(createSubscriberFn func(ref *duckv1.KReference, ur
 	))
 
 	f.Stable("test message without explicit prefer header should have the header").
-		Must("delivers events",
+		Must("delivers events", func(ctx context.Context, t feature.T) {
 			eventasssert.OnStore(sink).Match(
+				features.HasKnNamespaceHeader(environment.FromContext(ctx).Namespace()),
 				eventasssert.HasAdditionalHeader("Prefer", "reply"),
-			).AtLeast(1))
+			).AtLeast(1)(ctx, t)
+		})
 
 	return f
 }
@@ -334,6 +343,8 @@ func channelSubscriberUnreachable(createSubscriberFn func(ref *duckv1.KReference
 	channelName := feature.MakeRandomK8sName("channel")
 	sub := feature.MakeRandomK8sName("subscription")
 
+	subscriberUri := fmt.Sprintf("http://fake.svc.%s", network.GetClusterDomainName())
+
 	ev := test.FullEvent()
 
 	f.Setup("install sink", eventshub.Install(sink, eventshub.StartReceiver))
@@ -342,7 +353,7 @@ func channelSubscriberUnreachable(createSubscriberFn func(ref *duckv1.KReference
 
 	f.Setup("install subscription", subscription.Install(sub,
 		subscription.WithChannel(channel_impl.AsRef(channelName)),
-		createSubscriberFn(nil, "http://fake.svc.cluster.local"),
+		createSubscriberFn(nil, subscriberUri),
 	))
 	f.Setup("channel is ready", channel_impl.IsReady(channelName))
 	f.Setup("channel is addressable", channel_impl.IsAddressable(channelName))
@@ -358,7 +369,7 @@ func channelSubscriberUnreachable(createSubscriberFn func(ref *duckv1.KReference
 
 	f.Assert("Receives dls extensions when subscriber is unreachable", eventasssert.OnStore(sink).
 		MatchEvent(
-			test.HasExtension("knativeerrordest", "http://fake.svc.cluster.local")).
+			test.HasExtension("knativeerrordest", subscriberUri)).
 		AtLeast(1),
 	)
 
@@ -405,7 +416,7 @@ func channelSubscriberReturnedErrorNoData(createSubscriberFn func(ref *duckv1.KR
 		sink,
 		func(ctx context.Context) test.EventMatcher {
 			failerAddress, _ := service.Address(ctx, failer)
-			return test.HasExtension("knativeerrordest", failerAddress.String())
+			return test.HasExtension("knativeerrordest", failerAddress.URL.String())
 		},
 		func(ctx context.Context) test.EventMatcher {
 			return test.HasExtension("knativeerrorcode", "422")
@@ -456,7 +467,7 @@ func channelSubscriberReturnedErrorWithData(createSubscriberFn func(ref *duckv1.
 		sink,
 		func(ctx context.Context) test.EventMatcher {
 			failerAddress, _ := service.Address(ctx, failer)
-			return test.HasExtension("knativeerrordest", failerAddress.String())
+			return test.HasExtension("knativeerrordest", failerAddress.URL.String())
 		},
 		func(ctx context.Context) test.EventMatcher {
 			return test.HasExtension("knativeerrorcode", "422")

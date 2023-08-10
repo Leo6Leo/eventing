@@ -36,8 +36,8 @@ func NewServerManager(ctx context.Context, logger *zap.Logger, cmw configmap.Wat
 		logger.Info("failed to get TLS server config", zap.Error(err))
 	}
 
-	httpReceiver := kncloudevents.NewHTTPMessageReceiver(httpPort)
-	httpsReceiver := kncloudevents.NewHTTPMessageReceiver(httpsPort, kncloudevents.WithTLSConfig(tlsConfig))
+	httpReceiver := kncloudevents.NewHTTPEventReceiver(httpPort)
+	httpsReceiver := kncloudevents.NewHTTPEventReceiver(httpsPort, kncloudevents.WithTLSConfig(tlsConfig))
 
 	return eventingtls.NewServerManager(ctx, httpReceiver, httpsReceiver, handler, cmw)
 }
@@ -45,7 +45,7 @@ func NewServerManager(ctx context.Context, logger *zap.Logger, cmw configmap.Wat
 func getServerTLSConfig(ctx context.Context) (*tls.Config, error) {
 	secret := types.NamespacedName{
 		Namespace: "knative-eventing",
-		Name:      "mt-broker-filter-server-tls",
+		Name:      eventingtls.BrokerFilterServerTLSSecretName,
 	}
 
 	serverTLSConfig := eventingtls.NewDefaultServerConfig()

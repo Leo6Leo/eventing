@@ -60,8 +60,6 @@ const (
 	subscriptionDeleteFailed = "SubscriptionDeleteFailed"
 	subscriptionCreateFailed = "SubscriptionCreateFailed"
 	subscriptionGetFailed    = "SubscriptionGetFailed"
-
-	brokerFilterTLSSecretName = "mt-broker-filter-server-tls" //nolint:gosec // This is not a hardcoded credential
 )
 
 type Reconciler struct {
@@ -350,13 +348,13 @@ func getBrokerChannelRef(b *eventingv1.Broker) (*corev1.ObjectReference, error) 
 }
 
 func (r *Reconciler) getCaCerts() (string, error) {
-	secret, err := r.secretLister.Secrets(system.Namespace()).Get(brokerFilterTLSSecretName)
+	secret, err := r.secretLister.Secrets(system.Namespace()).Get(eventingtls.BrokerFilterServerTLSSecretName)
 	if err != nil {
-		return "", fmt.Errorf("failed to get CA certs from %s/%s: %w", system.Namespace(), brokerFilterTLSSecretName, err)
+		return "", fmt.Errorf("failed to get CA certs from %s/%s: %w", system.Namespace(), eventingtls.BrokerFilterServerTLSSecretName, err)
 	}
 	caCerts, ok := secret.Data[eventingtls.SecretCACert]
 	if !ok {
-		return "", fmt.Errorf("failed to get CA certs from %s/%s: missing %s key", system.Namespace(), brokerFilterTLSSecretName, eventingtls.SecretCACert)
+		return "", fmt.Errorf("failed to get CA certs from %s/%s: missing %s key", system.Namespace(), eventingtls.BrokerFilterServerTLSSecretName, eventingtls.SecretCACert)
 	}
 	return string(caCerts), nil
 }

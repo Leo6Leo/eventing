@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -32,28 +31,29 @@ import (
 	"go.opencensus.io/trace"
 	"go.uber.org/zap"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/utils/pointer"
 
-	"knative.dev/pkg/network"
+	"knative.dev/pkg/apis"
+	duckv1 "knative.dev/pkg/apis/duck/v1"
 
 	"knative.dev/eventing/pkg/apis/eventing"
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
 	"knative.dev/eventing/pkg/broker"
+	v1 "knative.dev/eventing/pkg/client/informers/externalversions/eventing/v1"
 	eventinglisters "knative.dev/eventing/pkg/client/listers/eventing/v1"
+	"knative.dev/eventing/pkg/eventtype"
 	"knative.dev/eventing/pkg/kncloudevents"
 	"knative.dev/eventing/pkg/tracing"
 	"knative.dev/eventing/pkg/utils"
 )
 
 const (
-	// noDuration signals that the dispatch step hasn't started
-	noDuration = -1
+	defaultMaxIdleConnections        = 1000
+	defaultMaxIdleConnectionsPerHost = 1000
 )
 
 type Handler struct {
-	// Receiver receives incoming HTTP requests
-	Receiver *kncloudevents.HTTPMessageReceiver
-	// Sender sends requests to the broker
-	Sender *kncloudevents.HTTPMessageSender
 	// Defaults sets default values to incoming events
 	Defaulter client.EventDefaulter
 	// Reporter reports stats of status code and dispatch time
@@ -61,7 +61,57 @@ type Handler struct {
 	// BrokerLister gets broker objects
 	BrokerLister eventinglisters.BrokerLister
 
+	EvenTypeHandler *eventtype.EventTypeAutoHandler
+
 	Logger *zap.Logger
+}
+
+func NewHandler(logger *zap.Logger, reporter StatsReporter, defaulter client.EventDefaulter, brokerInformer v1.BrokerInformer) (*Handler, error) {
+	connectionArgs := kncloudevents.ConnectionArgs{
+		MaxIdleConns:        defaultMaxIdleConnections,
+		MaxIdleConnsPerHost: defaultMaxIdleConnectionsPerHost,
+	}
+	kncloudevents.ConfigureConnectionArgs(&connectionArgs)
+
+	brokerInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			broker, ok := obj.(eventingv1.Broker)
+			if !ok {
+				return
+			}
+			kncloudevents.AddOrUpdateAddressableHandler(duckv1.Addressable{
+				URL:     broker.Status.Address.URL,
+				CACerts: broker.Status.Address.CACerts,
+			})
+		},
+		UpdateFunc: func(_, obj interface{}) {
+			broker, ok := obj.(eventingv1.Broker)
+			if !ok {
+				return
+			}
+			kncloudevents.AddOrUpdateAddressableHandler(duckv1.Addressable{
+				URL:     broker.Status.Address.URL,
+				CACerts: broker.Status.Address.CACerts,
+			})
+		},
+		DeleteFunc: func(obj interface{}) {
+			broker, ok := obj.(eventingv1.Broker)
+			if !ok {
+				return
+			}
+			kncloudevents.DeleteAddressableHandler(duckv1.Addressable{
+				URL:     broker.Status.Address.URL,
+				CACerts: broker.Status.Address.CACerts,
+			})
+		},
+	})
+
+	return &Handler{
+		Defaulter:    defaulter,
+		Reporter:     reporter,
+		Logger:       logger,
+		BrokerLister: brokerInformer.Lister(),
+	}, nil
 }
 
 func (h *Handler) getBroker(name, namespace string) (*eventingv1.Broker, error) {
@@ -73,32 +123,34 @@ func (h *Handler) getBroker(name, namespace string) (*eventingv1.Broker, error) 
 	return broker, nil
 }
 
-func guessChannelAddress(name, namespace, domain string) string {
-	url := url.URL{
-		Scheme: "http",
-		Host:   fmt.Sprintf("%s-kne-trigger-kn-channel.%s.svc.%s", name, namespace, domain),
-		Path:   "/",
-	}
-	return url.String()
-}
-
-func (h *Handler) getChannelAddress(name, namespace string) (string, error) {
+func (h *Handler) getChannelAddress(name, namespace string) (*duckv1.Addressable, error) {
 	broker, err := h.getBroker(name, namespace)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if broker.Status.Annotations == nil {
-		return "", fmt.Errorf("Broker status annotations uninitialized")
+		return nil, fmt.Errorf("broker status annotations uninitialized")
 	}
 	address, present := broker.Status.Annotations[eventing.BrokerChannelAddressStatusAnnotationKey]
 	if !present {
-		return "", fmt.Errorf("Channel address not found in broker status annotations")
+		return nil, fmt.Errorf("channel address not found in broker status annotations")
 	}
-	return address, nil
-}
 
-func (h *Handler) Start(ctx context.Context) error {
-	return h.Receiver.StartListen(ctx, h)
+	url, err := apis.ParseURL(address)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse channel address url")
+	}
+
+	var caCerts *string
+	certs, present := broker.Status.Annotations[eventing.BrokerChannelCACertsStatusAnnotationKey]
+	if present && certs != "" {
+		caCerts = pointer.String(certs)
+	}
+	addr := &duckv1.Addressable{
+		URL:     url,
+		CACerts: caCerts,
+	}
+	return addr, nil
 }
 
 func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -174,17 +226,37 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		eventType: event.Type(),
 	}
 
-	statusCode, dispatchTime := h.receive(ctx, request.Header, event, brokerNamespace, brokerName)
-	if dispatchTime > noDuration {
+	statusCode, dispatchTime := h.receive(ctx, utils.PassThroughHeaders(request.Header), event, brokerNamespace, brokerName)
+	if dispatchTime > kncloudevents.NoDuration {
 		_ = h.Reporter.ReportEventDispatchTime(reporterArgs, statusCode, dispatchTime)
 	}
 	_ = h.Reporter.ReportEventCount(reporterArgs, statusCode)
 
 	writer.WriteHeader(statusCode)
+
+	// EventType auto-create feature handling
+	if h.EvenTypeHandler != nil {
+		b, err := h.getBroker(brokerName, brokerNamespace)
+		if err != nil {
+			h.Logger.Warn("Failed to retrieve broker", zap.Error(err))
+		}
+		if err := h.EvenTypeHandler.AutoCreateEventType(ctx, event, toKReference(b), b.GetUID()); err != nil {
+			h.Logger.Error("Even type auto create failed", zap.Error(err))
+		}
+	}
+}
+
+func toKReference(broker *eventingv1.Broker) *duckv1.KReference {
+	return &duckv1.KReference{
+		Kind:       broker.Kind,
+		Namespace:  broker.Namespace,
+		Name:       broker.Name,
+		APIVersion: broker.APIVersion,
+		Address:    broker.Status.Address.Name,
+	}
 }
 
 func (h *Handler) receive(ctx context.Context, headers http.Header, event *cloudevents.Event, brokerNamespace, brokerName string) (int, time.Duration) {
-
 	// Setting the extension as a string as the CloudEvents sdk does not support non-string extensions.
 	event.SetExtension(broker.EventArrivalTime, cloudevents.Timestamp{Time: time.Now()})
 	if h.Defaulter != nil {
@@ -194,51 +266,20 @@ func (h *Handler) receive(ctx context.Context, headers http.Header, event *cloud
 
 	if ttl, err := broker.GetTTL(event.Context); err != nil || ttl <= 0 {
 		h.Logger.Debug("dropping event based on TTL status.", zap.Int32("TTL", ttl), zap.String("event.id", event.ID()), zap.Error(err))
-		return http.StatusBadRequest, noDuration
+		return http.StatusBadRequest, kncloudevents.NoDuration
 	}
 
 	channelAddress, err := h.getChannelAddress(brokerName, brokerNamespace)
 	if err != nil {
-		h.Logger.Warn("Failed to get channel address, falling back on guess", zap.Error(err))
-		channelAddress = guessChannelAddress(brokerName, brokerNamespace, network.GetClusterDomainName())
+		h.Logger.Warn("Broker not found in the namespace", zap.Error(err))
+		return http.StatusBadRequest, kncloudevents.NoDuration
 	}
 
-	return h.send(ctx, headers, event, channelAddress)
-}
-
-func (h *Handler) send(ctx context.Context, headers http.Header, event *cloudevents.Event, target string) (int, time.Duration) {
-
-	request, err := h.Sender.NewCloudEventRequestWithTarget(ctx, target)
-	if err != nil {
-		h.Logger.Error("failed to create event request.", zap.Error(err))
-		return http.StatusInternalServerError, noDuration
-	}
-
-	message := binding.ToMessage(event)
-	defer message.Finish(nil)
-
-	additionalHeaders := utils.PassThroughHeaders(headers)
-	err = kncloudevents.WriteHTTPRequestWithAdditionalHeaders(ctx, message, request, additionalHeaders)
-	if err != nil {
-		h.Logger.Error("failed to write request additionalHeaders.", zap.Error(err))
-		return http.StatusInternalServerError, noDuration
-	}
-
-	resp, dispatchTime, err := h.sendAndRecordDispatchTime(request)
-	if resp != nil {
-		defer resp.Body.Close()
-	}
+	dispatchInfo, err := kncloudevents.SendEvent(ctx, *event, *channelAddress, kncloudevents.WithHeader(headers))
 	if err != nil {
 		h.Logger.Error("failed to dispatch event", zap.Error(err))
-		return http.StatusInternalServerError, dispatchTime
+		return http.StatusInternalServerError, kncloudevents.NoDuration
 	}
 
-	return resp.StatusCode, dispatchTime
-}
-
-func (h *Handler) sendAndRecordDispatchTime(request *http.Request) (*http.Response, time.Duration, error) {
-	start := time.Now()
-	resp, err := h.Sender.Send(request)
-	dispatchTime := time.Since(start)
-	return resp, dispatchTime, err
+	return dispatchInfo.ResponseCode, dispatchInfo.Duration
 }

@@ -28,7 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"knative.dev/pkg/apis"
+	duckv1 "knative.dev/pkg/apis/duck/v1"
 	"knative.dev/reconciler-test/pkg/environment"
 	"knative.dev/reconciler-test/pkg/feature"
 	"knative.dev/reconciler-test/pkg/k8s"
@@ -158,8 +158,23 @@ func IsAddressable(name string, timings ...time.Duration) feature.StepFn {
 	return k8s.IsAddressable(GVR(), name, timings...)
 }
 
+// ValidateAddress validates the address retured by Address
+func ValidateAddress(name string, validate addressable.ValidateAddress, timings ...time.Duration) feature.StepFn {
+	return func(ctx context.Context, t feature.T) {
+		addr, err := Address(ctx, name, timings...)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if err := validate(addr); err != nil {
+			t.Error(err)
+			return
+		}
+	}
+}
+
 // Address returns a broker's address.
-func Address(ctx context.Context, name string, timings ...time.Duration) (*apis.URL, error) {
+func Address(ctx context.Context, name string, timings ...time.Duration) (*duckv1.Addressable, error) {
 	return addressable.Address(ctx, GVR(), name, timings...)
 }
 
